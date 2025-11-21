@@ -12,30 +12,47 @@ import tempfile
 # 1) Dropbox 下载模型
 # ----------------------------------------
 
-DROPBOX_URL = "https://www.dropbox.com/s/xxxxx/county_models.joblib?dl=1"  
-# ↑↑↑ 把这个换成你真实的 dl=1 链接
+import os
+import requests
+import hashlib
 
+DROPBOX_URL = "https://dl.dropboxusercontent.com/scl/fi/0w2lumdeb0g2z3rr16u5e/county_models.joblib?rlkey=mzxha28ahre7j0m1esim6sf0q&raw=1"
 LOCAL_MODEL_PATH = "county_models.joblib"
 
 def download_model():
-    # 如果本地已经下载过，就不重复下载
     if os.path.exists(LOCAL_MODEL_PATH):
         print("Model already exists locally.")
         return
 
-    print("Downloading model from Dropbox...")
+    print("Downloading model from Dropbox (streaming)...")
+    with requests.get(DROPBOX_URL, stream=True, allow_redirects=True, timeout=120) as r:
+        r.raise_for_status()
 
-    r = requests.get(DROPBOX_URL)
-    if r.status_code != 200:
-        raise Exception("Failed to download model! HTTP " + str(r.status_code))
+        content_type = r.headers.get("Content-Type", "")
+        # 如果 Dropbox 还在返回 HTML 页面，直接提示
+        if "text/html" in content_type.lower():
+            raise RuntimeError(
+                "Dropbox returned HTML instead of the model file. "
+                "Your link is not a raw direct-download link."
+            )
 
-    with open(LOCAL_MODEL_PATH, "wb") as f:
-        f.write(r.content)
+        total = 0
+        with open(LOCAL_MODEL_PATH, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):  # 1MB
+                if chunk:
+                    f.write(chunk)
+                    total += len(chunk)
 
-    print("Model downloaded → county_models.joblib")
+    if total < 5 * 1024 * 1024:  # 小于 5MB 基本不可能是你的模型
+        raise RuntimeError(
+            f"Downloaded file too small ({total/1024/1024:.2f} MB). "
+            "Likely not the real model file."
+        )
 
-# 下载模型
+    print(f"Model downloaded ✔ ({total/1024/1024:.1f} MB)")
+
 download_model()
+
 
 # ----------------------------------------
 # 2) 加载模型
