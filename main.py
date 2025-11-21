@@ -160,63 +160,74 @@ def infer_city(location: str):
 # =========================================================
 # 7) Predict endpoint (auto-fill city stats)
 # =========================================================
-@app.post("/predict", response_model=PredictResponse)
-def predict(req: PredictRequest):
+from fastapi import Query
+
+@app.post("/predict")
+def predict(req: PredictRequest, debug: bool = Query(False)):
     location = req.Location.strip()
     county = infer_county(location)
+
     if county is None or county not in COUNTY_MODELS:
-        return PredictResponse(predicted_price=-1, used_county=None, used_city=None)
+        return {
+            "predicted_price": -1,
+            "used_county": None,
+            "used_city": None,
+            "reason": "county not recognized"
+        }
 
     model = COUNTY_MODELS[county]
 
-    # 1) 先找 City 统计（优先）
+    # 1) 尝试 city stats（优先）
     city = infer_city(location)
     stats = None
-
     if city and city_lookup is not None and city in city_lookup.index:
         stats = city_lookup.loc[city]
     elif county_lookup is not None and county in county_lookup.index:
         stats = county_lookup.loc[county]
-
-    if stats is None:
-        # 没查到统计信息就返回错误
-        return PredictResponse(predicted_price=-1, used_county=county, used_city=city)
+    else:
+        # ✅ 关键改变：找不到 stats 就用空 Series，仍然继续预测
+        stats = pd.Series(dtype=float)
 
     # 2) 组装模型需要的特征
-    feat_cols = list(model.feature_names_in_)  # per-county true cols
-
+    feat_cols = list(model.feature_names_in_)
     row = {}
+
     for f in feat_cols:
         f_n = norm(f)
-        if f_n == norm("beds"):
-            row[f] = req.Beds
-        elif f_n == norm("baths"):
-            row[f] = req.Baths
-        elif f_n == norm("living space"):
-            row[f] = req.LivingSpace
+
+        if f_n == "beds":
+            row[f] = float(req.Beds)
+        elif f_n == "baths":
+            row[f] = float(req.Baths)
+        elif f_n == "living space":
+            row[f] = float(req.LivingSpace)
         else:
-            # 来自 stats（城市/县均值）
-            # 找 alias 对应的 csv col
+            # stats 里找同名特征
             target_key = None
             for k in ALIASES.keys():
                 if norm(k) == f_n:
                     target_key = k
                     break
-            if target_key and COL[target_key] in stats.index:
-                row[f] = stats[COL[target_key]]
+
+            if target_key and COL[target_key] and COL[target_key] in stats.index:
+                row[f] = float(stats[COL[target_key]])
             else:
-                row[f] = 0  # 找不到就兜底
+                row[f] = 0.0  # ✅ 找不到就补 0
 
     X = pd.DataFrame([row]).fillna(0)
 
     pred_log = model.predict(X)[0]
     pred_price = float(np.expm1(pred_log))
 
-    return PredictResponse(
-        predicted_price=pred_price,
-        used_county=county,
-        used_city=city
-    )
+    out = {
+        "predicted_price": pred_price,
+        "used_county": county,
+        "used_city": city
+    }
+    if debug:
+        out["final_features_used"] = row
+    return out
+
 
 @app.get("/")
 def health():
