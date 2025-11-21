@@ -7,33 +7,100 @@ import joblib
 import requests
 import os
 
-# ----------------------------
-# Dropbox download (keep your working version)
-# ----------------------------
-DROPBOX_URL = "https://dl.dropboxusercontent.com/scl/fi/0w2lumdeb0g2z3rr16u5e/county_models.joblib?rlkey=mzxha28ahre7j0m1esim6sf0q&raw=1"
-LOCAL_MODEL_PATH = "county_models.joblib"
+# =========================================================
+# 1) Download big files from Dropbox
+# =========================================================
 
-def download_model():
-    if os.path.exists(LOCAL_MODEL_PATH):
-        print("Model already exists locally.")
+MODEL_URL = "https://dl.dropboxusercontent.com/scl/fi/0w2lumdeb0g2z3rr16u5e/county_models.joblib?rlkey=mzxha28ahre7j0m1esim6sf0q&raw=1"
+MODEL_PATH = "county_models.joblib"
+
+CSV_URL = "https://www.dropbox.com/scl/fi/eopsl7xl68u42eub8meva/housingvars.csv?rlkey=cp59ajsh04wip925t1rvdmvtq&st=gck71hxr&raw=1"
+CSV_PATH = "housingvars.csv"
+
+def download_file(url, path, label):
+    if os.path.exists(path):
+        print(f"{label} already exists locally.")
         return
-
-    print("Downloading model from Dropbox (streaming)...")
-    with requests.get(DROPBOX_URL, stream=True, allow_redirects=True, timeout=120) as r:
+    print(f"Downloading {label} from Dropbox (streaming)...")
+    with requests.get(url, stream=True, allow_redirects=True, timeout=180) as r:
         r.raise_for_status()
         total = 0
-        with open(LOCAL_MODEL_PATH, "wb") as f:
+        with open(path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
                     total += len(chunk)
-    print(f"Model downloaded ✔ ({total/1024/1024:.1f} MB)")
+    print(f"{label} downloaded ✔ ({total/1024/1024:.1f} MB)")
 
-download_model()
+download_file(MODEL_URL, MODEL_PATH, "Model")
+download_file(CSV_URL, CSV_PATH, "Housing CSV")
 
-bundle = joblib.load(LOCAL_MODEL_PATH)
+# =========================================================
+# 2) Load models
+# =========================================================
+bundle = joblib.load(MODEL_PATH)
 COUNTY_MODELS = bundle["models"]
 
+# =========================================================
+# 3) Load & prepare lookup table from housingvars.csv
+# =========================================================
+df = pd.read_csv(CSV_PATH)
+
+# 只保留你模型会用的列（如果列名有空格/大小写，下面会做 alias）
+# 先统一列名，方便匹配
+def norm(c): 
+    return str(c).strip().lower()
+
+df.columns = [norm(c) for c in df.columns]
+
+# ---- 列名 alias（把训练列名映射到 csv 可能的写法）
+ALIASES = {
+    "beds": ["beds","bedrooms","bed"],
+    "baths": ["baths","bathrooms","bath"],
+    "living space": ["living space","living_space","squarefeet","sqft","living_sqft"],
+    "city average household income": ["city average household income","avg_income","medianincome","average household income"],
+    "crime rate": ["crime rate","crimerate","crime_rate"],
+    "latitude": ["latitude","lat"],
+    "longitude": ["longitude","lon","lng"],
+    "population": ["population","pop"],
+    "num_priv_schools": ["num_priv_schools","private_schools","num_private_schools"],
+    "percent_bike": ["percent_bike","pct_bike"],
+    "percent_car": ["percent_car","pct_car"],
+    "percent_carpool": ["percent_carpool","pct_carpool"],
+    "percent_home": ["percent_home","pct_home"],
+    "percent_publictr": ["percent_publictr","pct_publictr","percent_transit"],
+    "percent_total": ["percent_total","pct_total"],
+    "percent_walk": ["percent_walk","pct_walk"]
+}
+
+def pick_col(target):
+    """find real csv col name for a target feature"""
+    for cand in ALIASES[target]:
+        cand_n = norm(cand)
+        if cand_n in df.columns:
+            return cand_n
+    return None
+
+# 真实列名（csv版）
+COL = {k: pick_col(k) for k in ALIASES.keys()}
+
+# 必要的 ID 列（用来查城市/县）
+city_col   = "city"   if "city"   in df.columns else None
+county_col = "county" if "county" in df.columns else None
+
+# 做城市级 lookup：对每个 City 取均值（城市统计特征）
+city_lookup = None
+if city_col:
+    city_lookup = df.groupby(city_col).mean(numeric_only=True)
+
+# 做县级 lookup：对每个 County 取均值（fallback 用）
+county_lookup = None
+if county_col:
+    county_lookup = df.groupby(county_col).mean(numeric_only=True)
+
+# =========================================================
+# 4) FastAPI init
+# =========================================================
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -43,54 +110,113 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----------------------------
-# ✅ schema: allow extra fields
-# ----------------------------
+# =========================================================
+# 5) Request schema
+#    前端只需要传 Location + 三个房屋变量
+# =========================================================
 class PredictRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")  # 允许前端多传字段也不报错
-
-    County: str
-
-    # 你网页里会传的字段（可选）
-    Bedrooms: float | None = None
-    Bathrooms: float | None = None
-    SquareFeet: float | None = None
-    TotalRooms: float | None = None
-    CrimeRate: float | None = None
-    AvgIncome: float | None = None
-    YearBuilt: float | None = None
-    Latitude: float | None = None
-    Longitude: float | None = None
+    model_config = ConfigDict(extra="allow")
+    Location: str
+    Beds: float
+    Baths: float
+    LivingSpace: float
 
 class PredictResponse(BaseModel):
     predicted_price: float
+    used_county: str | None = None
+    used_city: str | None = None
 
-# ----------------------------
-# ✅ predict: align to each county model's features
-# ----------------------------
+# =========================================================
+# 6) Helper: parse county/city from Location
+# =========================================================
+COUNTY_MAP = {
+    "los angeles": "Los Angeles",
+    "fresno": "Fresno",
+    "san diego": "San Diego",
+    "sacramento": "Sacramento",
+    "san francisco": "San Francisco",
+    "santa clara": "Santa Clara",
+    "alameda": "Alameda"
+}
+
+def infer_county(location: str):
+    loc = location.lower()
+    for key, val in COUNTY_MAP.items():
+        if key in loc:
+            return val
+    return None
+
+def infer_city(location: str):
+    """粗暴版：用 location 前半段当 city；如果 csv 有 city 列就尝试匹配"""
+    if not city_col:
+        return None
+    loc = location.lower()
+    # 直接在 city_lookup index 里找包含关系
+    for city in city_lookup.index:
+        if str(city).lower() in loc:
+            return city
+    return None
+
+# =========================================================
+# 7) Predict endpoint (auto-fill city stats)
+# =========================================================
 @app.post("/predict", response_model=PredictResponse)
 def predict(req: PredictRequest):
-    county = req.County
-    if county not in COUNTY_MODELS:
-        return PredictResponse(predicted_price=-1)
+    location = req.Location.strip()
+    county = infer_county(location)
+    if county is None or county not in COUNTY_MODELS:
+        return PredictResponse(predicted_price=-1, used_county=None, used_city=None)
 
     model = COUNTY_MODELS[county]
 
-    # 1) 取出所有请求字段
-    req_dict = req.model_dump()
+    # 1) 先找 City 统计（优先）
+    city = infer_city(location)
+    stats = None
 
-    # 2) 只保留数值型（训练时也是 numeric-only）
-    X_all = pd.DataFrame([req_dict]).select_dtypes(include=["float64", "int64", "float32", "int32"])
+    if city and city_lookup is not None and city in city_lookup.index:
+        stats = city_lookup.loc[city]
+    elif county_lookup is not None and county in county_lookup.index:
+        stats = county_lookup.loc[county]
 
-    # 3) ✅ 用该县模型训练时的特征列对齐
-    feat_cols = list(model.feature_names_in_)  # 每个县自己的列（SF 不会有 Population）
-    X = X_all.reindex(columns=feat_cols, fill_value=0)
+    if stats is None:
+        # 没查到统计信息就返回错误
+        return PredictResponse(predicted_price=-1, used_county=county, used_city=city)
 
-    # 4) 预测（模型训练在 log1p(y)）
+    # 2) 组装模型需要的特征
+    feat_cols = list(model.feature_names_in_)  # per-county true cols
+
+    row = {}
+    for f in feat_cols:
+        f_n = norm(f)
+        if f_n == norm("beds"):
+            row[f] = req.Beds
+        elif f_n == norm("baths"):
+            row[f] = req.Baths
+        elif f_n == norm("living space"):
+            row[f] = req.LivingSpace
+        else:
+            # 来自 stats（城市/县均值）
+            # 找 alias 对应的 csv col
+            target_key = None
+            for k in ALIASES.keys():
+                if norm(k) == f_n:
+                    target_key = k
+                    break
+            if target_key and COL[target_key] in stats.index:
+                row[f] = stats[COL[target_key]]
+            else:
+                row[f] = 0  # 找不到就兜底
+
+    X = pd.DataFrame([row]).fillna(0)
+
     pred_log = model.predict(X)[0]
     pred_price = float(np.expm1(pred_log))
 
-    return PredictResponse(predicted_price=pred_price)
+    return PredictResponse(
+        predicted_price=pred_price,
+        used_county=county,
+        used_city=city
+    )
 
 @app.get("/")
 def health():
